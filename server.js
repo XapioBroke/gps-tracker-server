@@ -97,7 +97,7 @@ const server = net.createServer((socket) => {
 
         const courseStatus = data.readUInt16BE(20);
         const isSouth = !((courseStatus >> 10) & 0x01);
-        const isWest = !((courseStatus >> 11) & 0x01);
+        cconst isWest = ((courseStatus >> 11) & 0x01) === 1;
 
         const finalLat = isSouth ? -latitude : latitude;
         const finalLon = isWest ? -longitude : longitude;
