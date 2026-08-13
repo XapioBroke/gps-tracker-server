@@ -42,82 +42,119 @@ function buildAck(protocolNumber, serialNumber) {
   ]);
 }
 
+// Procesa UN solo paquete GT06 completo ya separado
+function processPacket(data, socket, clientInfo) {
+  console.log(`[PAQUETE] De ${clientInfo}:`);
+  console.log(`  Hex: ${data.toString('hex')}`);
+  console.log(`  Longitud: ${data.length} bytes`);
+
+  if (data.length < 5 || data[0] !== 0x78 || data[1] !== 0x78) {
+    console.log(`  [AVISO] Paquete no reconocido como GT06, se ignora`);
+    return;
+  }
+
+  const protocolNumber = data[3];
+
+  if (protocolNumber === 0x01) {
+    // LOGIN
+    const imeiBytes = data.slice(4, 12);
+    const imei = imeiBytes.toString('hex').replace(/^0/, '');
+    console.log(`  [LOGIN] IMEI del dispositivo: ${imei}`);
+
+    const serialNumber = data.slice(12, 14);
+    const ackPacket = buildAck(0x01, serialNumber);
+    socket.write(ackPacket);
+    console.log(`  [RESPUESTA] ACK de login enviado: ${ackPacket.toString('hex')}`);
+
+  } else if (protocolNumber === 0x13) {
+    // STATUS / HEARTBEAT
+    const serialNumber = data.slice(data.length - 6, data.length - 4);
+    const ackPacket = buildAck(0x13, serialNumber);
+    socket.write(ackPacket);
+    console.log(`  [HEARTBEAT] Paquete de estado recibido`);
+    console.log(`  [RESPUESTA] ACK de status enviado: ${ackPacket.toString('hex')}`);
+
+  } else if (protocolNumber === 0x12 || protocolNumber === 0x22) {
+    // POSICIÓN GPS
+    console.log(`  [GPS] ¡Paquete de posición recibido! (protocolo 0x${protocolNumber.toString(16)})`);
+
+    try {
+      const year = 2000 + data[4];
+      const month = data[5];
+      const day = data[6];
+      const hour = data[7];
+      const minute = data[8];
+      const second = data[9];
+
+      const latRaw = data.readUInt32BE(11);
+      const lonRaw = data.readUInt32BE(15);
+
+      const latitude = latRaw / 1800000;
+      const longitude = lonRaw / 1800000;
+
+      const courseStatus = data.readUInt16BE(20);
+      const isSouth = !((courseStatus >> 10) & 0x01);
+      const isWest = ((courseStatus >> 11) & 0x01) === 1;
+
+      const finalLat = isSouth ? -latitude : latitude;
+      const finalLon = isWest ? -longitude : longitude;
+
+      console.log(`  [GPS] Posición decodificada:`);
+      console.log(`    Fecha/hora: ${year}-${month}-${day} ${hour}:${minute}:${second} UTC`);
+      console.log(`    Latitud: ${finalLat.toFixed(6)}`);
+      console.log(`    Longitud: ${finalLon.toFixed(6)}`);
+      console.log(`    Google Maps: https://maps.google.com/?q=${finalLat.toFixed(6)},${finalLon.toFixed(6)}`);
+    } catch (err) {
+      console.log(`  [ERROR GPS] No se pudo decodificar la posición: ${err.message}`);
+    }
+
+    const serialNumber = data.slice(data.length - 6, data.length - 4);
+    const ackPacket = buildAck(protocolNumber, serialNumber);
+    socket.write(ackPacket);
+    console.log(`  [RESPUESTA] ACK de posición enviado: ${ackPacket.toString('hex')}`);
+
+  } else {
+    console.log(`  [INFO] Paquete tipo protocolo 0x${protocolNumber.toString(16)} recibido (aún no procesado)`);
+  }
+}
+
 const server = net.createServer((socket) => {
   const clientInfo = `${socket.remoteAddress}:${socket.remotePort}`;
   console.log(`[CONEXIÓN] Nuevo dispositivo conectado: ${clientInfo}`);
 
-  socket.on('data', (data) => {
-    console.log(`[DATOS] De ${clientInfo}:`);
-    console.log(`  Hex: ${data.toString('hex')}`);
-    console.log(`  Longitud: ${data.length} bytes`);
+  // Buffer acumulador propio de esta conexión — persiste entre eventos 'data'
+  let buffer = Buffer.alloc(0);
 
-    if (data.length < 5 || data[0] !== 0x78 || data[1] !== 0x78) {
-      console.log(`  [AVISO] Paquete no reconocido como GT06, se ignora`);
-      return;
-    }
+  socket.on('data', (chunk) => {
+    // Agrega lo que acaba de llegar al buffer acumulado
+    buffer = Buffer.concat([buffer, chunk]);
 
-    const protocolNumber = data[3];
-
-    if (protocolNumber === 0x01) {
-      // LOGIN
-      const imeiBytes = data.slice(4, 12);
-      const imei = imeiBytes.toString('hex').replace(/^0/, '');
-      console.log(`  [LOGIN] IMEI del dispositivo: ${imei}`);
-
-      const serialNumber = data.slice(12, 14);
-      const ackPacket = buildAck(0x01, serialNumber);
-      socket.write(ackPacket);
-      console.log(`  [RESPUESTA] ACK de login enviado: ${ackPacket.toString('hex')}`);
-
-    } else if (protocolNumber === 0x13) {
-      // STATUS / HEARTBEAT
-      const serialNumber = data.slice(data.length - 6, data.length - 4);
-      const ackPacket = buildAck(0x13, serialNumber);
-      socket.write(ackPacket);
-      console.log(`  [HEARTBEAT] Paquete de estado recibido`);
-      console.log(`  [RESPUESTA] ACK de status enviado: ${ackPacket.toString('hex')}`);
-
-    } else if (protocolNumber === 0x12 || protocolNumber === 0x22) {
-      // POSICIÓN GPS
-      console.log(`  [GPS] ¡Paquete de posición recibido! (protocolo 0x${protocolNumber.toString(16)})`);
-
-      try {
-        const year = 2000 + data[4];
-        const month = data[5];
-        const day = data[6];
-        const hour = data[7];
-        const minute = data[8];
-        const second = data[9];
-
-        const latRaw = data.readUInt32BE(11);
-        const lonRaw = data.readUInt32BE(15);
-
-        const latitude = latRaw / 1800000;
-        const longitude = lonRaw / 1800000;
-
-        const courseStatus = data.readUInt16BE(20);
-        const isSouth = !((courseStatus >> 10) & 0x01);
-        const isWest = ((courseStatus >> 11) & 0x01) === 1;
-
-        const finalLat = isSouth ? -latitude : latitude;
-        const finalLon = isWest ? -longitude : longitude;
-
-        console.log(`  [GPS] Posición decodificada:`);
-        console.log(`    Fecha/hora: ${year}-${month}-${day} ${hour}:${minute}:${second} UTC`);
-        console.log(`    Latitud: ${finalLat.toFixed(6)}`);
-        console.log(`    Longitud: ${finalLon.toFixed(6)}`);
-        console.log(`    Google Maps: https://maps.google.com/?q=${finalLat.toFixed(6)},${finalLon.toFixed(6)}`);
-      } catch (err) {
-        console.log(`  [ERROR GPS] No se pudo decodificar la posición: ${err.message}`);
+    // Mientras el buffer contenga al menos un paquete completo, lo extraemos y procesamos
+    while (true) {
+      // Busca el inicio de paquete (7878)
+      const startIndex = buffer.indexOf(Buffer.from([0x78, 0x78]));
+      if (startIndex === -1) {
+        // No hay inicio de paquete válido, descartamos basura acumulada
+        buffer = Buffer.alloc(0);
+        break;
+      }
+      if (startIndex > 0) {
+        // Hay basura antes del inicio, la recortamos
+        buffer = buffer.slice(startIndex);
       }
 
-      const serialNumber = data.slice(data.length - 6, data.length - 4);
-      const ackPacket = buildAck(protocolNumber, serialNumber);
-      socket.write(ackPacket);
-      console.log(`  [RESPUESTA] ACK de posición enviado: ${ackPacket.toString('hex')}`);
+      // Busca el fin de paquete (0d0a) después del inicio
+      const endIndex = buffer.indexOf(Buffer.from([0x0d, 0x0a]));
+      if (endIndex === -1) {
+        // Todavía no llegó el paquete completo, esperamos el siguiente 'data'
+        break;
+      }
 
-    } else {
-      console.log(`  [INFO] Paquete tipo protocolo 0x${protocolNumber.toString(16)} recibido (aún no procesado)`);
+      // Extrae el paquete completo (incluyendo el 0d0a final)
+      const packet = buffer.slice(0, endIndex + 2);
+      buffer = buffer.slice(endIndex + 2);
+
+      processPacket(packet, socket, clientInfo);
     }
   });
 
