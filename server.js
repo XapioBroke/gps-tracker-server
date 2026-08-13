@@ -19,30 +19,27 @@ function calculateCRC(buffer) {
   return crc;
 }
 
-// Construye la respuesta de confirmación (ACK) para un paquete de login
-function buildLoginAck(serialNumber) {
-  const protocolNumber = 0x01;
+// Construye una respuesta ACK genérica (sirve para login 0x01 y status 0x13)
+function buildAck(protocolNumber, serialNumber) {
   const content = Buffer.concat([
     Buffer.from([protocolNumber]),
-    serialNumber, // 2 bytes, mismo serial que mandó el dispositivo
+    serialNumber, // mismo número de serie que mandó el dispositivo
   ]);
 
-  const length = content.length + 2; // +2 por el CRC que viene después
+  const length = content.length + 2;
   const crcInput = Buffer.concat([Buffer.from([length]), content]);
   const crc = calculateCRC(crcInput);
 
   const crcBuffer = Buffer.alloc(2);
   crcBuffer.writeUInt16BE(crc, 0);
 
-  const packet = Buffer.concat([
-    Buffer.from([0x78, 0x78]), // inicio
+  return Buffer.concat([
+    Buffer.from([0x78, 0x78]),
     Buffer.from([length]),
     content,
     crcBuffer,
-    Buffer.from([0x0d, 0x0a]), // fin
+    Buffer.from([0x0d, 0x0a]),
   ]);
-
-  return packet;
 }
 
 const server = net.createServer((socket) => {
@@ -53,29 +50,41 @@ const server = net.createServer((socket) => {
     console.log(`[DATOS] De ${clientInfo}:`);
     console.log(`  Hex: ${data.toString('hex')}`);
     console.log(`  Longitud: ${data.length} bytes`);
-    console.log(`  Timestamp: ${new Date().toISOString()}`);
 
-    // Validar que sea un paquete GT06 válido (empieza con 7878 y termina con 0d0a)
     if (data.length < 5 || data[0] !== 0x78 || data[1] !== 0x78) {
       console.log(`  [AVISO] Paquete no reconocido como GT06, se ignora`);
       return;
     }
 
-    const protocolNumber = data[2 + 1]; // posición del byte de protocolo (después de 7878 + length)
+    const protocolNumber = data[3];
 
     if (protocolNumber === 0x01) {
-      // Es un paquete de LOGIN
-      const imeiBytes = data.slice(4, 12); // 8 bytes de IMEI en BCD
-      const imei = imeiBytes.toString('hex').replace(/^0/, ''); // quita el 0 inicial de relleno
+      // LOGIN
+      const imeiBytes = data.slice(4, 12);
+      const imei = imeiBytes.toString('hex').replace(/^0/, '');
       console.log(`  [LOGIN] IMEI del dispositivo: ${imei}`);
 
-      const serialNumber = data.slice(12, 14); // 2 bytes de número de serie
-
-      const ackPacket = buildLoginAck(serialNumber);
+      const serialNumber = data.slice(12, 14);
+      const ackPacket = buildAck(0x01, serialNumber);
       socket.write(ackPacket);
       console.log(`  [RESPUESTA] ACK de login enviado: ${ackPacket.toString('hex')}`);
+
+    } else if (protocolNumber === 0x13) {
+      // STATUS / HEARTBEAT — necesita su propio ACK para que el dispositivo no se desconecte
+      const serialNumber = data.slice(data.length - 6, data.length - 4);
+      const ackPacket = buildAck(0x13, serialNumber);
+      socket.write(ackPacket);
+      console.log(`  [HEARTBEAT] Paquete de estado recibido`);
+      console.log(`  [RESPUESTA] ACK de status enviado: ${ackPacket.toString('hex')}`);
+
+    } else if (protocolNumber === 0x12 || protocolNumber === 0x22) {
+      // POSICIÓN GPS — este es el paquete que realmente buscamos
+      console.log(`  [GPS] ¡Paquete de posición recibido! (protocolo 0x${protocolNumber.toString(16)})`);
+      console.log(`  [GPS] Datos crudos a decodificar: ${data.toString('hex')}`);
+      // Aquí vamos a agregar el parser de lat/long en el siguiente paso
+
     } else {
-      console.log(`  [INFO] Paquete tipo protocolo 0x${protocolNumber.toString(16)} recibido (no es login, aún no procesado)`);
+      console.log(`  [INFO] Paquete tipo protocolo 0x${protocolNumber.toString(16)} recibido (aún no procesado)`);
     }
   });
 
@@ -86,10 +95,6 @@ const server = net.createServer((socket) => {
   socket.on('error', (err) => {
     console.log(`[ERROR] ${clientInfo}: ${err.message}`);
   });
-});
-
-server.on('error', (err) => {
-  console.log(`[ERROR SERVIDOR] ${err.message}`);
 });
 
 server.listen(PORT, '0.0.0.0', () => {
