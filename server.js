@@ -19,11 +19,11 @@ function calculateCRC(buffer) {
   return crc;
 }
 
-// Construye una respuesta ACK genérica (sirve para login 0x01 y status 0x13)
+// Construye una respuesta ACK genérica (sirve para login 0x01, status 0x13, posición 0x12/0x22)
 function buildAck(protocolNumber, serialNumber) {
   const content = Buffer.concat([
     Buffer.from([protocolNumber]),
-    serialNumber, // mismo número de serie que mandó el dispositivo
+    serialNumber,
   ]);
 
   const length = content.length + 2;
@@ -70,7 +70,7 @@ const server = net.createServer((socket) => {
       console.log(`  [RESPUESTA] ACK de login enviado: ${ackPacket.toString('hex')}`);
 
     } else if (protocolNumber === 0x13) {
-      // STATUS / HEARTBEAT — necesita su propio ACK para que el dispositivo no se desconecte
+      // STATUS / HEARTBEAT
       const serialNumber = data.slice(data.length - 6, data.length - 4);
       const ackPacket = buildAck(0x13, serialNumber);
       socket.write(ackPacket);
@@ -78,10 +78,43 @@ const server = net.createServer((socket) => {
       console.log(`  [RESPUESTA] ACK de status enviado: ${ackPacket.toString('hex')}`);
 
     } else if (protocolNumber === 0x12 || protocolNumber === 0x22) {
-      // POSICIÓN GPS — este es el paquete que realmente buscamos
+      // POSICIÓN GPS
       console.log(`  [GPS] ¡Paquete de posición recibido! (protocolo 0x${protocolNumber.toString(16)})`);
-      console.log(`  [GPS] Datos crudos a decodificar: ${data.toString('hex')}`);
-      // Aquí vamos a agregar el parser de lat/long en el siguiente paso
+
+      try {
+        const year = 2000 + data[4];
+        const month = data[5];
+        const day = data[6];
+        const hour = data[7];
+        const minute = data[8];
+        const second = data[9];
+
+        const latRaw = data.readUInt32BE(11);
+        const lonRaw = data.readUInt32BE(15);
+
+        const latitude = latRaw / 1800000;
+        const longitude = lonRaw / 1800000;
+
+        const courseStatus = data.readUInt16BE(20);
+        const isSouth = !((courseStatus >> 10) & 0x01);
+        const isWest = !((courseStatus >> 11) & 0x01);
+
+        const finalLat = isSouth ? -latitude : latitude;
+        const finalLon = isWest ? -longitude : longitude;
+
+        console.log(`  [GPS] Posición decodificada:`);
+        console.log(`    Fecha/hora: ${year}-${month}-${day} ${hour}:${minute}:${second} UTC`);
+        console.log(`    Latitud: ${finalLat.toFixed(6)}`);
+        console.log(`    Longitud: ${finalLon.toFixed(6)}`);
+        console.log(`    Google Maps: https://maps.google.com/?q=${finalLat.toFixed(6)},${finalLon.toFixed(6)}`);
+      } catch (err) {
+        console.log(`  [ERROR GPS] No se pudo decodificar la posición: ${err.message}`);
+      }
+
+      const serialNumber = data.slice(data.length - 6, data.length - 4);
+      const ackPacket = buildAck(protocolNumber, serialNumber);
+      socket.write(ackPacket);
+      console.log(`  [RESPUESTA] ACK de posición enviado: ${ackPacket.toString('hex')}`);
 
     } else {
       console.log(`  [INFO] Paquete tipo protocolo 0x${protocolNumber.toString(16)} recibido (aún no procesado)`);
@@ -95,6 +128,10 @@ const server = net.createServer((socket) => {
   socket.on('error', (err) => {
     console.log(`[ERROR] ${clientInfo}: ${err.message}`);
   });
+});
+
+server.on('error', (err) => {
+  console.log(`[ERROR SERVIDOR] ${err.message}`);
 });
 
 server.listen(PORT, '0.0.0.0', () => {
