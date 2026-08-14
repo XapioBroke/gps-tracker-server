@@ -1,6 +1,23 @@
 const net = require('net');
+const { initializeApp, cert } = require('firebase-admin/app');
+const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 
 const PORT = process.env.PORT || 5023;
+
+// ---- Inicialización de Firebase ----
+// En Railway: lee la credencial desde la variable de entorno FIREBASE_KEY (texto JSON completo)
+// En local: si no existe esa variable, usa el archivo firebase-key.json
+let serviceAccount;
+if (process.env.FIREBASE_KEY) {
+  serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
+} else {
+  serviceAccount = require('./firebase-key.json');
+}
+
+initializeApp({
+  credential: cert(serviceAccount),
+});
+const db = getFirestore();
 
 // Calcula el CRC-16/X25 que usa el protocolo GT06 para verificar integridad
 function calculateCRC(buffer) {
@@ -42,8 +59,27 @@ function buildAck(protocolNumber, serialNumber) {
   ]);
 }
 
+// Guarda una posición GPS en Firestore
+async function savePosition(imei, positionData) {
+  try {
+    await db.collection('devices').doc(imei).set({
+      lastPosition: positionData,
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    await db.collection('devices').doc(imei).collection('history').add({
+      ...positionData,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+
+    console.log(`  [FIREBASE] Posición guardada para IMEI ${imei}`);
+  } catch (err) {
+    console.log(`  [ERROR FIREBASE] No se pudo guardar: ${err.message}`);
+  }
+}
+
 // Procesa UN solo paquete GT06 completo ya separado
-function processPacket(data, socket, clientInfo) {
+function processPacket(data, socket, clientInfo, connectionState) {
   console.log(`[PAQUETE] De ${clientInfo}:`);
   console.log(`  Hex: ${data.toString('hex')}`);
   console.log(`  Longitud: ${data.length} bytes`);
@@ -56,9 +92,9 @@ function processPacket(data, socket, clientInfo) {
   const protocolNumber = data[3];
 
   if (protocolNumber === 0x01) {
-    // LOGIN
     const imeiBytes = data.slice(4, 12);
     const imei = imeiBytes.toString('hex').replace(/^0/, '');
+    connectionState.imei = imei;
     console.log(`  [LOGIN] IMEI del dispositivo: ${imei}`);
 
     const serialNumber = data.slice(12, 14);
@@ -67,7 +103,6 @@ function processPacket(data, socket, clientInfo) {
     console.log(`  [RESPUESTA] ACK de login enviado: ${ackPacket.toString('hex')}`);
 
   } else if (protocolNumber === 0x13) {
-    // STATUS / HEARTBEAT
     const serialNumber = data.slice(data.length - 6, data.length - 4);
     const ackPacket = buildAck(0x13, serialNumber);
     socket.write(ackPacket);
@@ -75,7 +110,6 @@ function processPacket(data, socket, clientInfo) {
     console.log(`  [RESPUESTA] ACK de status enviado: ${ackPacket.toString('hex')}`);
 
   } else if (protocolNumber === 0x12 || protocolNumber === 0x22) {
-    // POSICIÓN GPS
     console.log(`  [GPS] ¡Paquete de posición recibido! (protocolo 0x${protocolNumber.toString(16)})`);
 
     try {
@@ -104,6 +138,16 @@ function processPacket(data, socket, clientInfo) {
       console.log(`    Latitud: ${finalLat.toFixed(6)}`);
       console.log(`    Longitud: ${finalLon.toFixed(6)}`);
       console.log(`    Google Maps: https://maps.google.com/?q=${finalLat.toFixed(6)},${finalLon.toFixed(6)}`);
+
+      if (connectionState.imei) {
+        savePosition(connectionState.imei, {
+          latitude: finalLat,
+          longitude: finalLon,
+          timestampUTC: `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')} ${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:${String(second).padStart(2, '0')}`,
+        });
+      } else {
+        console.log(`  [AVISO] Posición recibida sin login previo, no se guarda (falta IMEI)`);
+      }
     } catch (err) {
       console.log(`  [ERROR GPS] No se pudo decodificar la posición: ${err.message}`);
     }
@@ -122,39 +166,31 @@ const server = net.createServer((socket) => {
   const clientInfo = `${socket.remoteAddress}:${socket.remotePort}`;
   console.log(`[CONEXIÓN] Nuevo dispositivo conectado: ${clientInfo}`);
 
-  // Buffer acumulador propio de esta conexión — persiste entre eventos 'data'
   let buffer = Buffer.alloc(0);
+  const connectionState = { imei: null };
 
   socket.on('data', (chunk) => {
-    // Agrega lo que acaba de llegar al buffer acumulado
     buffer = Buffer.concat([buffer, chunk]);
 
-    // Mientras el buffer contenga al menos un paquete completo, lo extraemos y procesamos
     while (true) {
-      // Busca el inicio de paquete (7878)
       const startIndex = buffer.indexOf(Buffer.from([0x78, 0x78]));
       if (startIndex === -1) {
-        // No hay inicio de paquete válido, descartamos basura acumulada
         buffer = Buffer.alloc(0);
         break;
       }
       if (startIndex > 0) {
-        // Hay basura antes del inicio, la recortamos
         buffer = buffer.slice(startIndex);
       }
 
-      // Busca el fin de paquete (0d0a) después del inicio
       const endIndex = buffer.indexOf(Buffer.from([0x0d, 0x0a]));
       if (endIndex === -1) {
-        // Todavía no llegó el paquete completo, esperamos el siguiente 'data'
         break;
       }
 
-      // Extrae el paquete completo (incluyendo el 0d0a final)
       const packet = buffer.slice(0, endIndex + 2);
       buffer = buffer.slice(endIndex + 2);
 
-      processPacket(packet, socket, clientInfo);
+      processPacket(packet, socket, clientInfo, connectionState);
     }
   });
 
